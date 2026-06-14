@@ -1,9 +1,3 @@
-"""
-PostBot MY — Myanmar (Burmese)
-Admin → post → set price → publish to Group/Channel
-Buyer → pay → proof + address → admin review
-"""
-
 import logging
 import asyncio
 import json
