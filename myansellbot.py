@@ -1,3 +1,9 @@
+"""
+PostBot MY — Myanmar (Burmese)
+Admin → post → set price → publish to Group/Channel
+Buyer → pay → proof + address → admin review
+"""
+
 import logging
 import asyncio
 import json
@@ -11,7 +17,16 @@ import time
 from datetime import datetime, timedelta
 
 from flask import Flask, request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.error import Conflict, Forbidden
 from telegram.ext import (
     Application,
@@ -32,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("postbot_my")
 
-TOKEN = os.environ.get("POSTBOT_TOKEN", "8655662511:AAGM5EA_-EzKTD87oypmLhbbPkNp1jHHBwI")
+TOKEN = os.environ.get("POSTBOT_TOKEN", "8655662511:AAFb7TtQYDMW8i864u13bpuaA5cdaFN71u8")
 MASTER_ID = int(os.environ.get("POSTBOT_MASTER", "8807178282"))
 PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.environ.get("POSTBOT_DB", "postbot_my_data.db")
@@ -106,6 +121,13 @@ def init_db():
                 price1 REAL, price2 REAL, price3 REAL, no_price INTEGER DEFAULT 0
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS staff (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                added_at TEXT
+            )"""
+        )
         for k, v in DEFAULT_PAY.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
@@ -119,6 +141,10 @@ def _migrate_db(conn):
         conn.execute("ALTER TABLE listings ADD COLUMN price_mode TEXT DEFAULT 'qty'")
     if "prices_json" not in listing_cols:
         conn.execute("ALTER TABLE listings ADD COLUMN prices_json TEXT")
+    if "publisher_id" not in listing_cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN publisher_id INTEGER")
+    if "publisher_name" not in listing_cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN publisher_name TEXT")
     draft_cols = {r[1] for r in conn.execute("PRAGMA table_info(admin_drafts)").fetchall()}
     if "price_mode" not in draft_cols:
         conn.execute("ALTER TABLE admin_drafts ADD COLUMN price_mode TEXT DEFAULT 'qty'")
@@ -130,6 +156,7 @@ def _migrate_db(conn):
     for col, typedef in [
         ("item_label", "TEXT"), ("source_chat_id", "INTEGER"), ("source_message_id", "INTEGER"),
         ("post_link", "TEXT"), ("buyer_phone", "TEXT"),
+        ("publisher_id", "INTEGER"), ("publisher_name", "TEXT"), ("source_chat_title", "TEXT"),
     ]:
         if col not in order_cols:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {typedef}")
@@ -260,13 +287,15 @@ def db_get_default(user_id: int) -> int | None:
 
 
 def db_create_listing(media_type, file_id, caption, p1, p2, p3,
-                      price_mode="qty", prices_json=None) -> int:
+                      price_mode="qty", prices_json=None,
+                      publisher_id=None, publisher_name=None) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
             "INSERT INTO listings (media_type,file_id,caption,price1,price2,price3,created_at,"
-            "price_mode,prices_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            "price_mode,prices_json,publisher_id,publisher_name) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (media_type, file_id, caption or "", p1, p2, p3,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price_mode, prices_json),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price_mode, prices_json,
+             publisher_id, publisher_name),
         )
         return cur.lastrowid
 
@@ -338,6 +367,70 @@ def db_daily_stats(date: str) -> dict:
     return {"count": row[0], "total": row[1] or 0}
 
 
+def db_daily_stats_by_publisher(date: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """SELECT COALESCE(publisher_name, 'Admin အဓိက') AS pname,
+                      COUNT(*) AS cnt, COALESCE(SUM(price), 0) AS total
+               FROM orders WHERE created_at LIKE ? AND status='success'
+               GROUP BY publisher_id ORDER BY total DESC""",
+            (f"{date}%",),
+        ).fetchall()
+    return [{"name": r[0], "count": r[1], "total": r[2]} for r in rows]
+
+
+def db_add_staff(user_id: int, name: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO staff VALUES (?, ?, ?)",
+            (user_id, name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+
+
+def db_remove_staff(user_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM staff WHERE user_id=?", (user_id,))
+
+
+def db_list_staff() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id, name, added_at FROM staff ORDER BY added_at"
+        ).fetchall()
+    return [{"user_id": r[0], "name": r[1], "added_at": r[2]} for r in rows]
+
+
+def db_get_staff(user_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT user_id, name FROM staff WHERE user_id=?", (user_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {"user_id": row[0], "name": row[1]}
+
+
+def db_is_staff(user_id: int) -> bool:
+    if user_id is None:
+        return False
+    if int(user_id) == int(MASTER_ID):
+        return True
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT 1 FROM staff WHERE user_id=?", (int(user_id),)).fetchone()
+    return row is not None
+
+
+def db_get_target_title(chat_id: int | None) -> str:
+    if not chat_id:
+        return ""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT title, chat_type FROM targets WHERE chat_id=?", (chat_id,)).fetchone()
+    if not row:
+        return str(chat_id)
+    kind = "Channel" if row[1] == "channel" else "Group"
+    return f"{row[0]} ({kind})"
+
+
 def db_update_order(oid: int, **fields):
     if not fields:
         return
@@ -381,6 +474,28 @@ def is_master(user_id: int | None) -> bool:
     if user_id is None:
         return False
     return int(user_id) == int(MASTER_ID)
+
+
+def is_staff_user(user_id: int | None) -> bool:
+    return db_is_staff(user_id)
+
+
+def can_manage(user_id: int | None) -> bool:
+    return is_master(user_id)
+
+
+def publisher_display_name(user_id: int) -> str:
+    if is_master(user_id):
+        return "Admin အဓိက"
+    s = db_get_staff(user_id)
+    return s["name"] if s else str(user_id)
+
+
+def can_review_order(user_id: int, order: dict) -> bool:
+    if is_master(user_id):
+        return True
+    pub = order.get("publisher_id")
+    return pub is not None and int(user_id) == int(pub)
 
 
 async def reply(update: Update, text: str, **kwargs):
@@ -802,6 +917,7 @@ async def finish_publish(context, uid: int, draft: dict) -> tuple[bool, str]:
     if not target_ids:
         return False, "❌ Group/Channel အနည်းဆုံး ၁ ခု"
 
+    pub_name = publisher_display_name(uid)
     targets_map = {t["id"]: t for t in db_list_targets()}
     ok_count = 0
     fail_names = []
@@ -833,12 +949,14 @@ async def finish_publish(context, uid: int, draft: dict) -> tuple[bool, str]:
         lid = db_create_listing(
             draft["media_type"], draft.get("file_id", ""), draft.get("caption", ""),
             p1, p2, p3, price_mode="works", prices_json=prices_json,
+            publisher_id=uid, publisher_name=pub_name,
         )
         price_str = " / ".join(f"{i}#{p:g}" for i, p in enumerate(work_prices, 1))
     else:
         lid = db_create_listing(
             draft["media_type"], draft.get("file_id", ""), draft.get("caption", ""),
             draft["price1"], draft["price2"], draft["price3"],
+            publisher_id=uid, publisher_name=pub_name,
         )
         price_str = f"{draft['price1']}/{draft['price2']}/{draft['price3']}"
 
@@ -897,7 +1015,21 @@ HELP_ADMIN = (
     "/targets — bind Group/Channel\n"
     "/default — default ထုတ်ဝေရာ\n"
     "/bind /unbind /ping /id\n"
-    "/orders — Web အော်ဒါ Admin"
+    "/orders — Web အော်ဒါ Admin\n"
+    "/addstaff /removestaff /staff — ခွင့်ပြုထားသူ (Admin အဓိကသာ)"
+)
+
+HELP_STAFF = (
+    "📮 <b>ခွင့်ပြုထားသူ Panel</b>\n\n"
+    "သင်လုပ်နိုင်သည် —\n"
+    "• /post ထုတ်ဝေပြီး ဈေးနှုန်း သတ်မှတ်\n"
+    "• /setpay ငွေလက်ခံအချက်အလက်\n"
+    "• သင် ထုတ်ဝေသော လက်ရာ ရောင်းချ时 စစ်ဆေးချက် သင့်ထံ ရောက်မည်\n\n"
+    "<b>Commands —</b>\n"
+    "/post — ထုတ်ဝေမည်\n"
+    "/done — ပုံများ ပြီးပြီ\n"
+    "/setpay — ငွေလက်ခံအချက်အလက်\n"
+    "/ping /id /help"
 )
 
 HELP_BUYER = (
@@ -907,6 +1039,71 @@ HELP_BUYER = (
 )
 
 HELP_GROUP = "📮 Bot အဆင်သင့်\nGroup ID — <code>{cid}</code>\nAdmin — /bind ဖြင့် bind"
+
+# input ribbon (ReplyKeyboard below chat box)
+BTN_POST = "📝 ထုတ်ဝေမည်"
+BTN_DONE = "✅ ပုံများ ပြီးပြီ"
+BTN_SETPAY = "💳 ငွေလက်ခံအချက်အလက်"
+BTN_TARGETS = "📋 Group/Channel"
+BTN_DEFAULT = "⭐ default ထုတ်ဝေရာ"
+BTN_BIND = "🔗 bind Group/Channel"
+BTN_ORDERS = "📊 Web အော်ဒါ"
+BTN_STAFF = "👥 ခွင့်ပြုသူ"
+BTN_HELP = "❓ အကူအညီ"
+BTN_ID = "🆔 ID"
+BTN_PING = "📡 Online"
+
+
+def build_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    if is_master(user_id):
+        rows = [
+            [KeyboardButton(BTN_POST), KeyboardButton(BTN_DONE)],
+            [KeyboardButton(BTN_SETPAY), KeyboardButton(BTN_TARGETS)],
+            [KeyboardButton(BTN_DEFAULT), KeyboardButton(BTN_BIND)],
+            [KeyboardButton(BTN_ORDERS), KeyboardButton(BTN_STAFF)],
+            [KeyboardButton(BTN_ID), KeyboardButton(BTN_HELP)],
+        ]
+    elif is_staff_user(user_id):
+        rows = [
+            [KeyboardButton(BTN_POST), KeyboardButton(BTN_DONE)],
+            [KeyboardButton(BTN_SETPAY), KeyboardButton(BTN_ID)],
+            [KeyboardButton(BTN_HELP)],
+        ]
+    else:
+        rows = [[KeyboardButton(BTN_HELP), KeyboardButton(BTN_ID)]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def menu_handlers_for(user_id: int) -> dict[str, object]:
+    handlers = {
+        BTN_POST: cmd_post,
+        BTN_DONE: cmd_done,
+        BTN_SETPAY: cmd_setpay,
+        BTN_HELP: cmd_help,
+        BTN_ID: cmd_id,
+        BTN_PING: cmd_ping,
+    }
+    if can_manage(user_id):
+        handlers.update({
+            BTN_TARGETS: cmd_targets,
+            BTN_DEFAULT: cmd_default,
+            BTN_BIND: cmd_bind,
+            BTN_ORDERS: cmd_orders,
+            BTN_STAFF: cmd_staff,
+        })
+    return handlers
+
+
+async def try_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.message
+    user = update.effective_user
+    if not msg or not msg.text or not user:
+        return False
+    handler = menu_handlers_for(user.id).get(msg.text.strip())
+    if not handler:
+        return False
+    await handler(update, context)
+    return True
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -927,11 +1124,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_payment_menu(context, user.id, order_id)
             return
 
+        kb = build_menu_keyboard(user.id)
         if is_master(user.id):
-            await reply(update, HELP_ADMIN, parse_mode="HTML")
+            await reply(update, HELP_ADMIN, parse_mode="HTML", reply_markup=kb)
+        elif is_staff_user(user.id):
+            await reply(update, HELP_STAFF, parse_mode="HTML", reply_markup=kb)
         else:
             admin = db_get_setting("admin_username").lstrip("@")
-            await reply(update, HELP_BUYER.format(admin=admin))
+            await reply(update, HELP_BUYER.format(admin=admin), reply_markup=kb)
     else:
         await reply(update, HELP_GROUP.format(cid=chat.id), parse_mode="HTML")
 
@@ -946,18 +1146,80 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ok = is_master(user.id if user else None)
+    ok_master = is_master(user.id if user else None)
+    ok_staff = is_staff_user(user.id if user else None)
+    if ok_master:
+        role = "Admin အဓိက"
+    elif ok_staff:
+        role = "ခွင့်ပြုထားသူ"
+    else:
+        role = "သုံးစွဲသူ"
     await reply(
         update,
         f"သင့် ID — <code>{user.id if user else '?'}</code>\n"
-        f"Admin — <code>{MASTER_ID}</code>\n"
-        f"{'✅ Admin' if ok else '❌ Admin မဟုတ်'}",
+        f"Admin အဓိက — <code>{MASTER_ID}</code>\n"
+        f"အဆင့် — {role}",
         parse_mode="HTML",
     )
 
 
+async def cmd_addstaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_manage(update.effective_user.id):
+        await reply(update, "Admin အဓိကသာ ခွင့်ပြုသူ ထည့်နိုင်သည်။")
+        return
+    target_id, name = None, ""
+    msg = update.effective_message
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+        name = msg.reply_to_message.from_user.full_name or msg.reply_to_message.from_user.username or str(target_id)
+    elif context.args:
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await reply(update, "သုံးနည်း — msg ကို reply လုပ်ပြီး /addstaff\nသို့မဟုတ် /addstaff userID [နာမည်]")
+            return
+        name = " ".join(context.args[1:]) if len(context.args) > 1 else str(target_id)
+    else:
+        await reply(update, "သုံးနည်း — msg ကို reply လုပ်ပြီး /addstaff\nသို့မဟုတ် /addstaff userID [နာမည်]")
+        return
+    if target_id == MASTER_ID:
+        await reply(update, "Admin အဓိကကို ထည့်စရာ မလို။")
+        return
+    db_add_staff(target_id, name)
+    await reply(update, f"✅ ခွင့်ပြုသူ ထည့်ပြီး — {name} (<code>{target_id}</code>)", parse_mode="HTML")
+
+
+async def cmd_removestaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_manage(update.effective_user.id):
+        return
+    if not context.args:
+        await reply(update, "သုံးနည်း — /removestaff userID")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await reply(update, "userID ဂဏန်း ထည့်ပါ")
+        return
+    db_remove_staff(uid)
+    await reply(update, f"✅ ဖယ်ရှားပြီး — <code>{uid}</code>", parse_mode="HTML")
+
+
+async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_manage(update.effective_user.id):
+        return
+    staff = db_list_staff()
+    lines = ["👥 <b>ခွင့်ပြုထားသူ</b>\n", f"Admin အဓိက — <code>{MASTER_ID}</code>"]
+    if not staff:
+        lines.append("\nအခြား ခွင့်ပြုသူ မရှိ။")
+    else:
+        for i, s in enumerate(staff, 1):
+            lines.append(f"{i}. {s['name']} — <code>{s['user_id']}</code>")
+    lines.append("\nထည့် — reply /addstaff\nဖယ် — /removestaff userID")
+    await reply(update, "\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_setpay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_master(update.effective_user.id):
+    if not is_staff_user(update.effective_user.id):
         return
     if len(context.args) < 2:
         await reply(
@@ -997,8 +1259,8 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     if chat.type == "private":
-        if not is_master(user.id if user else None):
-            await reply(update, "Admin သာ bind လုပ်နိုင်သည်။")
+        if not can_manage(user.id if user else None):
+            await reply(update, "Admin အဓိကသာ bind လုပ်နိုင်သည်။")
             return
         if context.args:
             try:
@@ -1010,22 +1272,22 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await reply(update, "Group/Channel msg forward လုပ်ပါ သို့မဟုတ် /bind -100xxx")
         return
-    if not is_master(user.id if user else None):
-        await reply(update, "Admin သာ bind လုပ်နိုင်သည်။")
+    if not can_manage(user.id if user else None):
+        await reply(update, "Admin အဓိကသာ bind လုပ်နိုင်သည်။")
         return
     await verify_and_bind(update, context, chat.id, chat.title or str(chat.id), chat.type)
 
 
 async def cmd_unbind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    if chat.type == "private" or not is_master(update.effective_user.id):
+    if chat.type == "private" or not can_manage(update.effective_user.id):
         return
     db_remove_target(chat.id)
     await reply(update, "✅ bind ဖြုတ်ပြီး။")
 
 
 async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_master(update.effective_user.id):
+    if not can_manage(update.effective_user.id):
         return
     targets = db_list_targets()
     if not targets:
@@ -1040,7 +1302,7 @@ async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_master(update.effective_user.id):
+    if not can_manage(update.effective_user.id):
         return
     base = WEB_BASE_URL.rstrip("/") if WEB_BASE_URL else f"http://localhost:{PORT}"
     url = f"{base}/admin?key={ADMIN_WEB_KEY}"
@@ -1055,7 +1317,7 @@ async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_master(update.effective_user.id):
+    if not can_manage(update.effective_user.id):
         return
     targets = db_list_targets()
     if not targets:
@@ -1065,7 +1327,7 @@ async def cmd_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_master(update.effective_user.id):
+    if not is_staff_user(update.effective_user.id):
         return
     db_save_draft(update.effective_user.id, {"step": "await_content"})
     await reply(
@@ -1081,7 +1343,7 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_master(update.effective_user.id):
+    if not is_staff_user(update.effective_user.id):
         return
     uid = update.effective_user.id
     draft = db_get_draft(uid)
@@ -1102,7 +1364,7 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     user = update.effective_user
-    if not is_master(user.id if user else None):
+    if not is_staff_user(user.id if user else None):
         return
 
     msg = update.message
@@ -1112,6 +1374,8 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         draft = db_get_draft(user.id)
         if not draft:
+            if not can_manage(user.id):
+                return
             source = forward_chat(msg)
             if source and source.type in ("channel", "group", "supergroup"):
                 await verify_and_bind(update, context, source.id, source.title or str(source.id), source.type)
@@ -1163,7 +1427,7 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_admin_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not is_master(update.effective_user.id):
+    if update.effective_chat.type != "private" or not is_staff_user(update.effective_user.id):
         return
     uid = update.effective_user.id
     draft = db_get_draft(uid)
@@ -1299,11 +1563,16 @@ async def on_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     src_chat = extra.get("source_chat_id")
     src_msg = extra.get("source_message_id")
     post_link = build_message_link(src_chat, src_msg) if src_chat and src_msg else ""
+    chat_title = db_get_target_title(src_chat)
+    pub_id = listing.get("publisher_id") or MASTER_ID
+    pub_name = listing.get("publisher_name") or publisher_display_name(pub_id)
 
     name = buyer.full_name or buyer.username or str(buyer.id)
     oid = db_create_order(
         listing_id, buyer.id, name, qty, price,
-        item_label=label, source_chat_id=src_chat, source_message_id=src_msg, post_link=post_link,
+        item_label=label, source_chat_id=src_chat, source_message_id=src_msg,
+        post_link=post_link, publisher_id=pub_id, publisher_name=pub_name,
+        source_chat_title=chat_title,
     )
     db_set_buyer_session(buyer.id, oid, "await_pay_choice")
 
@@ -1357,8 +1626,17 @@ async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
 
+async def notify_order_for_review(context, order: dict, admin_text: str, proof_id: str | None, cap: str):
+    reviewer_id = order.get("publisher_id") or MASTER_ID
+    await context.bot.send_message(
+        reviewer_id, admin_text, parse_mode="HTML", reply_markup=review_buttons(order["id"]),
+    )
+    if proof_id:
+        await context.bot.send_photo(reviewer_id, proof_id, caption=cap)
+
+
 async def on_buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or is_master(update.effective_user.id):
+    if update.effective_chat.type != "private":
         return
 
     session = db_get_buyer_session(update.effective_user.id)
@@ -1424,9 +1702,14 @@ async def on_buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount_line = f"ပမာဏ — {format_mmk(mmk)} ကျပ်"
             if method == "usdt":
                 amount_line += f"\nUSDT：{mmk_to_usdt(mmk):.2f} USDT（÷{int(get_usdt_rate())}）"
+            chat_title = order.get("source_chat_title") or ""
+            pub_name = order.get("publisher_name") or "Admin အဓိက"
+            channel_line = f"Group/Channel — {chat_title}\n" if chat_title else ""
             link_line = f"လက်ရာ Link — <a href=\"{post_link}\">{post_link}</a>\n" if post_link else ""
             admin_text = (
-                f"🔔 <b>အော်ဒါ အသစ် #{order['id']}</b>\n\n"
+                f"🔔 <b>အော်ဒါ #{order['id']}</b>\n\n"
+                f"ထုတ်ဝေသူ — {pub_name}\n"
+                f"{channel_line}"
                 f"လက်ရာ — <b>{item_label}</b>\n"
                 f"{link_line}"
                 f"ဝယ်ယူသူ — {order['buyer_name']} (<code>{order['buyer_id']}</code>)\n"
@@ -1436,14 +1719,10 @@ async def on_buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"လိပ်စာ — {address}\n\n"
                 f"screenshot စစ်ပြီး နှိပ်ပါ —"
             )
-            await context.bot.send_message(
-                MASTER_ID, admin_text, parse_mode="HTML", reply_markup=review_buttons(order["id"]),
-            )
-            if proof_id:
-                cap = f"#{order['id']} | {item_label} | screenshot"
-                if post_link:
-                    cap += f"\n{post_link}"
-                await context.bot.send_photo(MASTER_ID, proof_id, caption=cap)
+            cap = f"#{order['id']} | {item_label} | screenshot"
+            if post_link:
+                cap += f"\n{post_link}"
+            await notify_order_for_review(context, order, admin_text, proof_id, cap)
             return
     except Exception as e:
         log.exception("buyer error")
@@ -1452,16 +1731,16 @@ async def on_buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_review_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_master(query.from_user.id):
-        await query.answer("ခွင့်မရှိ", show_alert=True)
-        return
-
-    _, oid, result = query.data.split(":")
-    order_id = int(oid)
+    order_id = int(query.data.split(":")[1])
     order = db_get_order(order_id)
     if not order:
         await query.answer("အော်ဒါ မရှိ", show_alert=True)
         return
+    if not can_review_order(query.from_user.id, order):
+        await query.answer("အော်ဒါ စစ်ဆေး ခွင့်မရှိ", show_alert=True)
+        return
+
+    _, _, result = query.data.split(":")
 
     admin_user = db_get_setting("admin_username").lstrip("@")
     buyer_id = order["buyer_id"]
@@ -1498,13 +1777,16 @@ async def on_review_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_master(query.from_user.id):
+    if not is_staff_user(query.from_user.id):
         return
 
     action, _, value = query.data.partition(":")
     uid = query.from_user.id
 
     if action == "def":
+        if not can_manage(query.from_user.id):
+            await query.answer("Admin အဓိကသာ", show_alert=True)
+            return
         if value == "cancel":
             await query.edit_message_text("ပယ်ဖျက်ပြီး။")
         else:
@@ -1643,6 +1925,19 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application) -> None:
     await application.bot.delete_webhook(drop_pending_updates=True)
+    await application.bot.set_my_commands([
+        BotCommand("post", "ထုတ်ဝေမည်"),
+        BotCommand("done", "ပုံများ ပြီးပြီ"),
+        BotCommand("setpay", "ငွေလက်ခံအချက်အလက်"),
+        BotCommand("targets", "Group/Channel"),
+        BotCommand("default", "default ထုတ်ဝေရာ"),
+        BotCommand("bind", "bind Group/Channel"),
+        BotCommand("orders", "Web အော်ဒါ Admin"),
+        BotCommand("staff", "ခွင့်ပြုသူ"),
+        BotCommand("help", "အကူအညီ"),
+        BotCommand("id", "ID"),
+        BotCommand("ping", "Online"),
+    ])
     me = await application.bot.get_me()
     wh = await application.bot.get_webhook_info()
     host = socket.gethostname()
@@ -1675,10 +1970,18 @@ def admin_orders_page():
 
     orders = db_list_orders(date=date)
     stats = db_daily_stats(date)
+    by_pub = db_daily_stats_by_publisher(date)
     status_map = {
         "pending_pay": "ငွေမပေးရသေး", "pending_review": "စစ်ဆေးရန်",
         "success": "အောင်မြင်", "failed": "မအောင်မြင်",
     }
+
+    pub_rows = ""
+    for p in by_pub:
+        pub_rows += (
+            f"<tr><td>{p['name']}</td><td>{p['count']}</td>"
+            f"<td>{format_mmk(p['total'])}</td></tr>"
+        )
 
     rows_html = ""
     for o in orders:
@@ -1686,8 +1989,11 @@ def admin_orders_page():
         link = o.get("post_link") or ""
         item = o.get("item_label") or f"ပစ္စည်း#{o.get('listing_id')}"
         link_cell = f'<a href="{link}" target="_blank">လက်ရာ Link</a>' if link else item
+        pub = o.get("publisher_name") or "Admin အဓိက"
+        ch = o.get("source_chat_title") or "-"
         rows_html += (
             f"<tr><td>{o['id']}</td><td>{o.get('created_at','')}</td>"
+            f"<td>{pub}</td><td>{ch}</td>"
             f"<td>{o.get('buyer_name','')}</td><td>{o.get('buyer_phone') or '-'}</td>"
             f"<td>{link_cell}</td><td>{o.get('address') or '-'}</td>"
             f"<td>{format_mmk(o.get('price', 0))}</td><td>{st}</td></tr>"
@@ -1730,9 +2036,16 @@ input[type=date]{{padding:6px;font-size:16px}}
   </p>
 </div>
 <div class="card" style="overflow-x:auto">
+<h3>📋 ထုတ်ဝေသူ အလိုက် ရောင်းချ (အောင်မြင်အော်ဒါ)</h3>
 <table>
-<tr><th>ID</th><th>အချိန်</th><th>ဝယ်ယူသူ</th><th>ဖုန်း</th><th>လက်ရာ</th><th>လိပ်စာ</th><th>ပမာဏ</th><th>အခြေအနေ</th></tr>
-{rows_html if rows_html else '<tr><td colspan="8">အော်ဒါမရှိ</td></tr>'}
+<tr><th>ထုတ်ဝေသူ</th><th>အရေအတွက်</th><th>ပမာဏ(ကျပ်)</th></tr>
+{pub_rows if pub_rows else '<tr><td colspan="3">မရှိ</td></tr>'}
+</table>
+</div>
+<div class="card" style="overflow-x:auto">
+<table>
+<tr><th>ID</th><th>အချိန်</th><th>ထုတ်ဝေသူ</th><th>Group/Channel</th><th>ဝယ်ယူသူ</th><th>ဖုန်း</th><th>လက်ရာ</th><th>လိပ်စာ</th><th>ပမာဏ</th><th>အခြေအနေ</th></tr>
+{rows_html if rows_html else '<tr><td colspan="10">အော်ဒါမရှိ</td></tr>'}
 </table>
 </div>
 </body></html>"""
@@ -1748,7 +2061,11 @@ async def on_private_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
-    if is_master(user.id):
+    if not db_get_buyer_session(user.id) and await try_menu_button(update, context):
+        return
+    if db_get_buyer_session(user.id):
+        await on_buyer_message(update, context)
+    elif is_staff_user(user.id):
         await on_admin_private(update, context)
     else:
         await on_buyer_message(update, context)
@@ -1764,6 +2081,7 @@ def create_app() -> Application:
         ("start", cmd_start), ("help", cmd_help), ("ping", cmd_ping), ("id", cmd_id),
         ("post", cmd_post), ("done", cmd_done), ("bind", cmd_bind), ("unbind", cmd_unbind),
         ("targets", cmd_targets), ("default", cmd_default), ("setpay", cmd_setpay), ("orders", cmd_orders),
+        ("addstaff", cmd_addstaff), ("removestaff", cmd_removestaff), ("staff", cmd_staff),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
         app.add_handler(CommandHandler(cmd, handler, filters=filters.UpdateType.CHANNEL_POSTS))
